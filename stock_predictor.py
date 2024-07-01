@@ -161,78 +161,126 @@ def train_model(stock_ticker, historical_years=10):
         critical_columns = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
         data = data.dropna(subset=critical_columns)
 
-        if data.empty:
-            raise ValueError("DataFrame is empty after dropping NaN values")
+        # Split data into features and target
+        X = data.drop(['Close'], axis=1)
+        y = data['Close']
 
-        # Shift 'Close' price to get next day's close price
-        data['target'] = data['Close'].shift(-1)
-
-        # Drop rows with NaN in target variable
-        data.dropna(subset=['target'], inplace=True)
-
-        if data.empty:
-            raise ValueError("DataFrame is empty after dropping NaN values in target variable")
-
-        X = data[['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume', 'MA_20', 'RSI', 'MACD', 'MACD_signal', 'BBANDS_middle', 'BBANDS_upper', 'BBANDS_lower', 'ATR', 'STOCH_slowk', 'STOCH_slowd', 'EMA_50', 'ADX', 'CCI']]
-        y = data['target']
-
-        # Train-test split
+        # Split data into training and testing sets
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-        if X_train.empty or X_test.empty:
-            raise ValueError("Train or test set is empty after splitting")
-
-        # Initialize XGBoost model
-        model = XGBRegressor(objective='reg:squarederror', n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42)
-
-        # Fit the model
+        # Train the XGBoost model
+        model = XGBRegressor()
         model.fit(X_train, y_train)
-
-        # Evaluate the model
-        train_score = model.score(X_train, y_train)
-        test_score = model.score(X_test, y_test)
-
-        logging.info(f"Training completed for {stock_ticker}. Train R^2: {train_score:.2f}, Test R^2: {test_score:.2f}")
 
         # Save the model
         model_filename = f"{stock_ticker}_model.pkl"
-        with open(model_filename, 'wb') as model_file:
-            pickle.dump(model, model_file)
+        with open(model_filename, 'wb') as file:
+            pickle.dump(model, file)
 
-        logging.info(f"Model saved as {model_filename}")
+        logging.info(f"Model trained and saved as {model_filename}")
 
         return model_filename
 
-    except ValueError as ve:
-        logging.error(f"Error in training model for {stock_ticker}: {ve}")
-        raise ve
     except Exception as e:
-        logging.error(f"Unexpected error in training model for {stock_ticker}: {e}")
-        raise ValueError("Error training model due to an unexpected error")
+        logging.error(f"Error training model: {e}")
+        raise ValueError("Error training model")
 
-# Endpoint to train the model
-@app.route('/train_model', methods=['POST'])
-def train_model_endpoint():
+# Function to load the trained model
+def load_model(model_filename):
     try:
-        request_data = request.get_json()
+        # Load the model from file
+        with open(model_filename, 'rb') as file:
+            model = pickle.load(file)
+        return model
+    except FileNotFoundError:
+        logging.error(f"Model file {model_filename} not found")
+        raise ValueError("Model file not found")
+    except Exception as e:
+        logging.error(f"Error loading model: {e}")
+        raise ValueError("Error loading model")
 
-        # Parse request data
-        stock_ticker = request_data.get('stock_ticker')
-        historical_years = request_data.get('historical_years', 10)
+# Function to predict future stock prices
+def predict_future_prices(stock_ticker, periods=30):
+    try:
+        # Load the trained model
+        model_filename = f"{stock_ticker}_model.pkl"
+        with open(model_filename, 'rb') as model_file:
+            model = pickle.load(model_file)
 
-        # Validate inputs
-        if not stock_ticker:
-            return jsonify({'error': 'Stock ticker symbol is required'}), 400
+        # Fetch the most recent data point to predict future prices
+        end_date = datetime.today().strftime('%Y-%m-%d')
+        start_date = (datetime.today() - timedelta(days=365)).strftime('%Y-%m-%d')
+        data = fetch_data(stock_ticker, start_date, end_date)
 
+        # Preprocess the most recent data point
+        data = preprocess_data(data)
+
+        # Ensure data has the same features as during training
+        # Assuming the number of features is consistent with training
+        latest_data_point = data.iloc[-1].values.reshape(1, -1)
+
+        # Predict future prices
+        future_dates = pd.date_range(end_date, periods=periods + 1)[1:]
+        future_predictions = []
+        for i in range(periods):
+            next_prediction = model.predict(latest_data_point)
+            future_predictions.append(next_prediction[0])
+            # Update latest_data_point for the next prediction step
+            latest_data_point = np.append(latest_data_point[:, 1:], [[next_prediction]], axis=1)
+
+        # Format the predictions
+        future_predictions = pd.Series(future_predictions, index=future_dates)
+
+        return future_predictions.to_dict()
+
+    except Exception as e:
+        logging.error(f"Error predicting future prices: {e}")
+        raise ValueError("Error predicting future prices")
+
+
+# Route to train the model
+@app.route('/train_model', methods=['POST'])
+def train_model_route():
+    try:
+        # Get stock ticker and historical years from request body
+        req_data = request.get_json()
+        stock_ticker = req_data.get('stock_ticker')
+        historical_years = req_data.get('historical_years', 10)
+
+        # Train the model
         model_filename = train_model(stock_ticker, historical_years)
-        return jsonify({'message': f'Model trained successfully for {stock_ticker}', 'model_filename': model_filename}), 200
+
+        return jsonify({
+            "message": f"Model trained successfully for {stock_ticker}",
+            "model_filename": model_filename
+        }), 200
 
     except ValueError as ve:
-        return jsonify({'error': str(ve)}), 400
+        return jsonify({"error": str(ve)}), 400
     except Exception as e:
-        logging.error(f"Unexpected error in train_model_endpoint: {e}")
-        return jsonify({'error': 'Unexpected error occurred'}), 500
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
-# Run the Flask application
+# Route to predict future prices
+@app.route('/predict_future', methods=['POST'])
+def predict_future_route():
+    try:
+        # Get stock ticker and periods from request body
+        req_data = request.get_json()
+        stock_ticker = req_data.get('stock_ticker')
+        periods = req_data.get('periods', 30)
+
+        # Predict future prices
+        future_predictions = predict_future_prices(stock_ticker, periods)
+
+        return jsonify({
+            "stock_ticker": stock_ticker,
+            "future_predictions": future_predictions
+        }), 200
+
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Internal server error: {str(e)}"}), 500
+
 if __name__ == '__main__':
     app.run(debug=True)
