@@ -1,3 +1,4 @@
+# Import the necessary libraries
 import os
 import numpy as np
 import pandas as pd
@@ -6,55 +7,57 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import logging
 from xgboost import XGBRegressor
-from sklearn.model_selection import GridSearchCV
+from sklearn.model_selection import train_test_split
 import pickle
 import time
+from requests.exceptions import ConnectionError, Timeout, HTTPError
+from sklearn.impute import SimpleImputer
 
+# Initialize Flask application
 app = Flask(__name__)
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)  # Adjust logging level as needed
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def date_to_timestamp(date_str):
-    # Convert date string to datetime object
-    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-    # Convert datetime object to Unix timestamp
-    timestamp = int(time.mktime(date_obj.timetuple()))
-    return timestamp
-
+# Function to fetch historical data from Yahoo Finance
 def fetch_data(stock_ticker, start_date, end_date, max_retries=3):
     retries = 0
     while retries < max_retries:
         try:
             # Fetch data from Yahoo Finance
-            data = yf.download(stock_ticker, start=start_date, end=end_date)
+            data = yf.download(stock_ticker, start=start_date, end=end_date, progress=False)
             if data.empty:
                 raise ValueError(f"No data available for {stock_ticker} between {start_date} and {end_date}")
-            if not all(col in data.columns for col in ['High', 'Low', 'Close']):
+            if not all(col in data.columns for col in ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']):
                 raise ValueError("Missing required columns in data")
             return data
-        except (ConnectionError, TimeoutError) as ce:
+        except (ConnectionError, Timeout, HTTPError) as ce:
             retries += 1
             logging.error(f"Connection or timeout error fetching data for {stock_ticker}: {ce}")
             if retries == max_retries:
                 raise ValueError(f"Failed to fetch data after {max_retries} retries")
             time.sleep(1)  # Add a delay before retrying, if needed
+        except ValueError as ve:
+            retries += 1
+            logging.error(f"No data available for {stock_ticker} between {start_date} and {end_date}")
+            raise ve
         except Exception as e:
             retries += 1
             logging.error(f"Error fetching data for {stock_ticker}: {e}")
             if retries == max_retries:
                 raise ValueError(f"Failed to fetch data after {max_retries} retries")
             time.sleep(1)  # Add a delay before retrying, if needed
-
     # If all retries fail
     raise ValueError(f"Failed to fetch data for {stock_ticker} after {max_retries} retries")
 
-
-    
 def preprocess_data(data):
     try:
-        if data.isnull().values.any():
-            data = data.interpolate(method='linear')  # Use linear interpolation for missing values
+        # Check for NaN values in critical columns
+        if data[['Close', 'High', 'Low']].isnull().any().any():
+            raise ValueError("NaN values present in critical columns (Close, High, Low)")
+
+        # Interpolate NaN values
+        data = data.interpolate(method='linear')
 
         # Convert index to datetime if needed
         data.index = pd.to_datetime(data.index)
@@ -81,8 +84,18 @@ def preprocess_data(data):
         data['STOCH_slowk'] = 100 * (data['Close'] - low_min) / (high_max - low_min)
         data['STOCH_slowd'] = data['STOCH_slowk'].rolling(window=3).mean()
         data['EMA_50'] = data['Close'].ewm(span=50, adjust=False).mean()
-        data['ADX'] = calculate_adx(data)
-        data['CCI'] = calculate_cci(data)
+        
+        # Handling ADX calculation
+        if 'ADX' in data.columns:
+            data['ADX'].fillna(method='ffill', inplace=True)  # Forward fill NaN values in ADX
+        else:
+            data['ADX'] = calculate_adx(data)  # Calculate ADX if not already present
+
+        # Handling CCI calculation
+        if 'CCI' in data.columns:
+            data['CCI'].fillna(method='bfill', inplace=True)  # Backward fill NaN values in CCI
+        else:
+            data['CCI'] = calculate_cci(data)  # Calculate CCI if not already present
 
         return data
 
@@ -124,141 +137,89 @@ def calculate_cci(data, n=20):
         logging.error(f"Error calculating CCI: {e}")
         raise ValueError("Error calculating CCI")
 
+# Function to train the model
 def train_model(stock_ticker, historical_years=10):
     try:
         # Convert historical_years to integer if it's passed as a string
         historical_years = int(historical_years)
 
         # Fetch historical data from Yahoo Finance
-        end_date = datetime.today()
-        start_date = end_date - timedelta(days=historical_years * 365)
+        end_date = datetime.today().strftime('%Y-%m-%d')
+        start_date = (datetime.today() - timedelta(days=historical_years * 365)).strftime('%Y-%m-%d')
 
         logging.info(f"Fetching historical data for {stock_ticker} from {start_date} to {end_date}")
-        data = fetch_data(stock_ticker, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-
-        if data.empty:
-            raise ValueError(f"No data available for training {stock_ticker} between {start_date} and {end_date}")
+        data = fetch_data(stock_ticker, start_date, end_date)
+        print(data)  # Print the fetched data to check its content
 
         # Preprocess data
-        logging.info("Preprocessing data...")
         data = preprocess_data(data)
 
-        # Drop NaN values
-        data.dropna(inplace=True)
+        # Ensure the data is aligned properly
+        if 'Close' not in data.columns:
+            raise ValueError("Missing 'Close' column after preprocessing")
+        X = data[['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume', 'MA_20', 'RSI', 'MACD', 'MACD_signal', 'BBANDS_middle', 'BBANDS_upper', 'BBANDS_lower', 'ATR', 'STOCH_slowk', 'STOCH_slowd', 'EMA_50', 'ADX', 'CCI']]
+        y = data['Close'].shift(-1)  # Shift 'Close' price to get next day's close price
 
-        # Define features and target
-        X = data[['Close', 'MA_20', 'RSI', 'MACD', 'MACD_signal', 'BBANDS_middle', 'BBANDS_upper', 'BBANDS_lower', 'ATR', 'STOCH_slowk', 'STOCH_slowd', 'EMA_50', 'ADX', 'CCI']]
-        y = data['Close'].shift(-1).dropna()
+        # Drop rows with NaN values in X or y
+        nan_indices = X.index[X.isna().any(axis=1)]
+        X.drop(nan_indices, axis=0, inplace=True)
+        y.drop(nan_indices, axis=0, inplace=True)
 
-        if len(X) == 0 or len(y) == 0:
-            raise ValueError(f"No data available for training {stock_ticker}")
-
-        # Split data into training and testing sets
-        train_size = int(len(X) * 0.8)
-        X_train, X_test = X[:train_size], X[train_size:]
-        y_train, y_test = y[:train_size], y[train_size:]
+        # Train-test split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
         # Initialize XGBoost model
-        model = XGBRegressor(objective='reg:squarederror', n_jobs=-1)
+        model = XGBRegressor(objective='reg:squarederror', n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42)
 
-        # Define hyperparameters for GridSearchCV
-        param_grid = {
-            'n_estimators': [100, 200, 300],
-            'max_depth': [3, 4, 5]
-        }
+        # Fit the model
+        model.fit(X_train, y_train)
 
-        # Perform Grid Search CV to find the best model
-        logging.info("Performing GridSearchCV for hyperparameter tuning...")
-        grid_search = GridSearchCV(estimator=model, param_grid=param_grid, scoring='neg_mean_squared_error', cv=5, verbose=1, n_jobs=-1)
-        grid_search.fit(X_train, y_train)
+        # Evaluate the model
+        train_score = model.score(X_train, y_train)
+        test_score = model.score(X_test, y_test)
 
-        # Get the best model from Grid Search
-        best_model = grid_search.best_estimator_
+        logging.info(f"Training completed for {stock_ticker}. Train R^2: {train_score:.2f}, Test R^2: {test_score:.2f}")
 
-        # Save the best model to disk
+        # Save the model
         model_filename = f"{stock_ticker}_model.pkl"
         with open(model_filename, 'wb') as model_file:
-            pickle.dump((best_model, X.columns), model_file)
+            pickle.dump(model, model_file)
 
-        logging.info(f"Saved model as {model_filename}")
+        logging.info(f"Model saved as {model_filename}")
 
+        return model_filename
+
+    except ValueError as ve:
+        logging.error(f"Error in training model for {stock_ticker}: {ve}")
+        raise ve
     except Exception as e:
-        logging.error(f"Error training model for {stock_ticker}: {e}")
-        raise ValueError(f"Error training model for {stock_ticker}: {e}")
+        logging.error(f"Unexpected error in training model for {stock_ticker}: {e}")
+        raise ValueError("Error training model due to an unexpected error")
 
-@app.route('/train/<stock_ticker>', methods=['POST'])
-def train(stock_ticker):
+
+# Endpoint to train the model
+@app.route('/train_model', methods=['POST'])
+def train_model_endpoint():
     try:
-        if request.method == 'POST':
-            data = request.get_json()
-            historical_years = data.get('historical_years', 10)
+        request_data = request.get_json()
 
-            # Train model
-            train_model(stock_ticker, historical_years)
+        # Parse request data
+        stock_ticker = request_data.get('stock_ticker')
+        historical_years = request_data.get('historical_years', 10)
 
-            return jsonify({"message": f"Model trained successfully for {stock_ticker}"}), 200
-
-    except Exception as e:
-        logging.error(f"Error training model for {stock_ticker}: {e}")
-        return jsonify({"error": f"Error training model for {stock_ticker}"}), 500
-
-
-def predict_future(stock_ticker, years=2):
-    try:
-        # Load the pre-trained model
-        model_filename = f"{stock_ticker}_model.pkl"
-        if not os.path.exists(model_filename):
-            raise ValueError(f"Model file {model_filename} not found for {stock_ticker}")
-
-        with open(model_filename, 'rb') as model_file:
-            model, X_columns = pickle.load(model_file)
-
-        # Fetch future stock data for prediction
-        end_date = datetime.today()
-        start_date = end_date + timedelta(days=1)  # Start from the next day after today
-
-        future_dates = pd.date_range(start=start_date, periods=8 * years, freq='Q')
-        future_data = pd.DataFrame(index=future_dates)
-
-        logging.info(f"Fetching future data for {stock_ticker} from {start_date} to {future_dates[-1]}")
-        future_data = fetch_data(stock_ticker, start_date.strftime('%Y-%m-%d'), future_dates[-1].strftime('%Y-%m-%d'))
-
-        # Preprocess future data
-        future_data = preprocess_data(future_data)
-
-        # Make predictions
-        future_predictions = []
-        for index, date in enumerate(future_dates):
-            if date in future_data.index:
-                future_data_slice = future_data.loc[date:date]
-                X_future = future_data_slice[X_columns]
-                prediction = model.predict(X_future)
-                future_predictions.append({
-                    "date": date.strftime('%Y-%m-%d'),
-                    "predicted_price": float(prediction[0])
-                })
-
-        return future_predictions
-
-    except Exception as e:
-        logging.error(f"Error predicting future prices for {stock_ticker}: {e}")
-        raise ValueError(f"Error predicting future prices for {stock_ticker}")
-
-@app.route('/predict', methods=['GET'])
-def predict():
-    try:
-        stock_ticker = request.args.get('stock_ticker')
+        # Validate inputs
         if not stock_ticker:
-            return jsonify({"error": "Missing stock_ticker parameter"}), 400
+            return jsonify({'error': 'Stock ticker symbol is required'}), 400
 
-        # Predict future prices
-        future_predictions = predict_future(stock_ticker)
+        model_filename = train_model(stock_ticker, historical_years)
+        return jsonify({'message': f'Model trained successfully for {stock_ticker}', 'model_filename': model_filename}), 200
 
-        return jsonify({"predictions": future_predictions}), 200
-
+    except ValueError as ve:
+        return jsonify({'error': str(ve)}), 400
     except Exception as e:
-        logging.error(f"Error predicting future prices: {e}")
-        return jsonify({"error": f"Error predicting future prices: {e}"}), 500
+        logging.error(f"Unexpected error in train_model_endpoint: {e}")
+        return jsonify({'error': 'Unexpected error occurred'}), 500
 
+# Run the Flask application
 if __name__ == '__main__':
     app.run(debug=True)
