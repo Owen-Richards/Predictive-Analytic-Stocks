@@ -217,7 +217,7 @@ def predict_future_prices(stock_ticker, periods=30):
 
         # Ensure data has the same features as during training
         # Assuming the number of features is consistent with training
-        latest_data_point = data.iloc[-1].values.reshape(1, -1)
+        latest_data_point = data.iloc[-1][['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume', 'MA_20', 'RSI', 'MACD', 'MACD_signal', 'BBANDS_middle', 'BBANDS_upper', 'BBANDS_lower', 'ATR', 'STOCH_slowk', 'STOCH_slowd', 'EMA_50', 'ADX', 'CCI']].values.reshape(1, -1)
 
         # Predict future prices
         future_dates = pd.date_range(end_date, periods=periods + 1)[1:]
@@ -225,8 +225,11 @@ def predict_future_prices(stock_ticker, periods=30):
         for i in range(periods):
             next_prediction = model.predict(latest_data_point)
             future_predictions.append(next_prediction[0])
+            
             # Update latest_data_point for the next prediction step
-            latest_data_point = np.append(latest_data_point[:, 1:], [[next_prediction]], axis=1)
+            latest_data_point = latest_data_point[:, 1:]  # Remove the first column if needed
+            new_feature = np.array([[next_prediction]])  # Reshape to (1, 1) if necessary
+            latest_data_point = np.concatenate((latest_data_point, new_feature), axis=1)  # Append next prediction
 
         # Format the predictions
         future_predictions = pd.Series(future_predictions, index=future_dates)
@@ -236,8 +239,7 @@ def predict_future_prices(stock_ticker, periods=30):
     except Exception as e:
         logging.error(f"Error predicting future prices: {e}")
         raise ValueError("Error predicting future prices")
-
-
+    
 # Route to train the model
 @app.route('/train_model', methods=['POST'])
 def train_model_route():
