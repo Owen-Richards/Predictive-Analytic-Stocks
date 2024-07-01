@@ -149,7 +149,6 @@ def train_model(stock_ticker, historical_years=10):
 
         logging.info(f"Fetching historical data for {stock_ticker} from {start_date} to {end_date}")
         data = fetch_data(stock_ticker, start_date, end_date)
-        print(data)  # Print the fetched data to check its content
 
         # Preprocess data
         data = preprocess_data(data)
@@ -157,16 +156,31 @@ def train_model(stock_ticker, historical_years=10):
         # Ensure the data is aligned properly
         if 'Close' not in data.columns:
             raise ValueError("Missing 'Close' column after preprocessing")
-        X = data[['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume', 'MA_20', 'RSI', 'MACD', 'MACD_signal', 'BBANDS_middle', 'BBANDS_upper', 'BBANDS_lower', 'ATR', 'STOCH_slowk', 'STOCH_slowd', 'EMA_50', 'ADX', 'CCI']]
-        y = data['Close'].shift(-1)  # Shift 'Close' price to get next day's close price
 
-        # Drop rows with NaN values in X or y
-        nan_indices = X.index[X.isna().any(axis=1)]
-        X.drop(nan_indices, axis=0, inplace=True)
-        y.drop(nan_indices, axis=0, inplace=True)
+        # Drop rows with NaN values in critical columns
+        critical_columns = ['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume']
+        data = data.dropna(subset=critical_columns)
+
+        if data.empty:
+            raise ValueError("DataFrame is empty after dropping NaN values")
+
+        # Shift 'Close' price to get next day's close price
+        data['target'] = data['Close'].shift(-1)
+
+        # Drop rows with NaN in target variable
+        data.dropna(subset=['target'], inplace=True)
+
+        if data.empty:
+            raise ValueError("DataFrame is empty after dropping NaN values in target variable")
+
+        X = data[['Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume', 'MA_20', 'RSI', 'MACD', 'MACD_signal', 'BBANDS_middle', 'BBANDS_upper', 'BBANDS_lower', 'ATR', 'STOCH_slowk', 'STOCH_slowd', 'EMA_50', 'ADX', 'CCI']]
+        y = data['target']
 
         # Train-test split
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        if X_train.empty or X_test.empty:
+            raise ValueError("Train or test set is empty after splitting")
 
         # Initialize XGBoost model
         model = XGBRegressor(objective='reg:squarederror', n_estimators=100, max_depth=6, learning_rate=0.1, random_state=42)
@@ -195,7 +209,6 @@ def train_model(stock_ticker, historical_years=10):
     except Exception as e:
         logging.error(f"Unexpected error in training model for {stock_ticker}: {e}")
         raise ValueError("Error training model due to an unexpected error")
-
 
 # Endpoint to train the model
 @app.route('/train_model', methods=['POST'])
